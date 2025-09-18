@@ -1,39 +1,39 @@
+// index.js
+
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
+const Redis = require("ioredis");
+const { OpenAI } = require("openai");
+const { QdrantClient } = require("@qdrant/js-client-rest");
 
 const app = express();
 
-// Allow requests from React frontend
+// --- Middleware ---
 app.use(cors({ origin: "http://localhost:3000" }));
-
 app.use(express.json());
 
-//redisss
-
-const Redis = require("ioredis");
-
-// Default connection (localhost:6379)
+// --- Redis setup ---
 const redis = new Redis();
-
-// Optional: log connection status
 redis.on("connect", () => console.log("✅ Connected to Redis"));
 redis.on("error", (err) => console.error("❌ Redis error:", err));
 
+// --- OpenAI client ---
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
 
-
-// In-memory store for now (we'll swap to Redis later)
-const sessions = {};
+// --- Qdrant client ---
+const qdrant = new QdrantClient({ url: "http://localhost:6333" });
 
 // --- Routes ---
 
-// Create new session
+// 1️⃣ Create new session
 app.post("/session", async (req, res) => {
     const sessionId = uuidv4();
-
     try {
-        // Save empty array for chat history
-        await redis.set(sessionId, JSON.stringify([]));
+        await redis.set(`session:${sessionId}`, JSON.stringify([]));
         res.json({ sessionId });
     } catch (err) {
         console.error("Error creating session:", err);
@@ -41,85 +41,79 @@ app.post("/session", async (req, res) => {
     }
 });
 
-
-
-
-// Chat endpoint
+// 2️⃣ Chat endpoint (RAG)
 app.post("/chat", async (req, res) => {
-    const { sessionId, message } = req.body;
-    if (!sessionId || !message) {
-        return res.status(400).json({ error: "sessionId and message are required" });
-    }
-
-    // Get chat history
-    let history = await redis.get(sessionId);
-    history = history ? JSON.parse(history) : [];
-
-    // Add user message
-    history.push({ role: "user", content: message });
-
-    // Mock bot response
-    const botResponse = `You said: "${message}". (This is a mocked response for now 🚀)`;
-    history.push({ role: "bot", content: botResponse });
-
-    // Save updated history back to Redis
-    await redis.set(sessionId, JSON.stringify(history));
-
-    res.json({ response: botResponse, history });
-});
-
-
-// Get session history
-app.get("/session/:id/history", (req, res) => {
-    const { id } = req.params;
-    if (!sessions[id]) {
-        return res.status(404).json({ error: "Session not found" });
-    }
-    res.json({ history: sessions[id] });
-});
-
-// Clear session
-// Delete session
-app.delete("/session/:sessionId", async (req, res) => {
-    const { sessionId } = req.params;
-
     try {
-        // THIS ACTUALLY REMOVES THE KEY
-        const deletedCount = await redis.del(sessionId);
+        const { sessionId, message } = req.body;
+        if (!sessionId || !message) return res.status(400).json({ error: "sessionId and message required" });
 
-        if (deletedCount === 0) {
-            return res.status(404).json({ error: "Session not found" });
-        }
+        // Embed user query
+        const embeddingResponse = await openai.embeddings.create({
+            model: "text-embedding-3-small",
+            input: message
+        });
+        const queryVector = embeddingResponse.data[0].embedding;
 
-        res.json({ message: `Session ${sessionId} deleted successfully 🚀` });
+        // Retrieve top 3 articles from Qdrant
+        const searchResults = await qdrant.points.search({
+            collection_name: "news_articles",
+            vector: queryVector,
+            limit: 3
+        });
+
+        const context = searchResults.map(r => r.payload.content).join("\n\n");
+
+        // Generate response
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { role: "system", content: "You are a helpful news assistant. Use the context to answer user questions." },
+                { role: "user", content: `Context: ${context}\n\nQuestion: ${message}` }
+            ]
+        });
+
+        const botResponse = completion.choices[0].message.content;
+
+        // Save conversation to Redis
+        const sessionKey = `session:${sessionId}`;
+        await redis.rPush(sessionKey, JSON.stringify({ role: "user", content: message }));
+        await redis.rPush(sessionKey, JSON.stringify({ role: "bot", content: botResponse }));
+
+        // Return response + full history
+        const history = await redis.lRange(sessionKey, 0, -1).then(arr => arr.map(JSON.parse));
+        res.json({ response: botResponse, history });
     } catch (err) {
-        console.error("Error deleting session:", err);
-        res.status(500).json({ error: "Internal server error" });
+        console.error(err);
+        res.status(500).json({ error: err.message });
     }
 });
 
-
-
-// Fetch session history
+// 3️⃣ Fetch session history
 app.get("/history/:sessionId", async (req, res) => {
     const { sessionId } = req.params;
-
     try {
-        const history = await redis.get(sessionId);  // <- use 'redis', not redisClient
-        if (!history) {
-            return res.status(404).json({ error: "Session not found" });
-        }
-
-        res.json(JSON.parse(history));
+        const history = await redis.lRange(`session:${sessionId}`, 0, -1).then(arr => arr.map(JSON.parse));
+        if (!history || history.length === 0) return res.status(404).json({ error: "Session not found" });
+        res.json(history);
     } catch (err) {
-        console.error("Error fetching history:", err);
+        console.error(err);
         res.status(500).json({ error: "Internal server error" });
     }
 });
 
-
-
-// Start server
-app.listen(3001, () => {
-    console.log("Backend server running on http://localhost:3001");
+// 4️⃣ Reset / delete session
+app.delete("/session/:sessionId", async (req, res) => {
+    const { sessionId } = req.params;
+    try {
+        const deletedCount = await redis.del(`session:${sessionId}`);
+        if (deletedCount === 0) return res.status(404).json({ error: "Session not found" });
+        res.json({ message: `Session ${sessionId} deleted successfully 🚀` });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Internal server error" });
+    }
 });
+
+// --- Start server ---
+const PORT = 3001;
+app.listen(PORT, () => console.log(`Backend server running on http://localhost:${PORT}`));
